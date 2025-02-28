@@ -2244,6 +2244,9 @@ class Yunbase():
                 if self.save_oof_preds:#if oof_preds is needed
                     np.save(self.model_save_path+f"{model_name}_seed{self.seed}_repeat{repeat}_fold{self.num_folds}_{self.target_col}.npy",oof_preds)
 
+    def get_trained_models(self,):
+        return self.trained_models
+
     #calculate each model cross validation metric scores.
     def CVMetricsSummary(self,):
         if self.objective=='regression':
@@ -2349,7 +2352,11 @@ class Yunbase():
         
         return test_preds
     
-    def predict(self,test_path_or_file:str|pd.DataFrame|pl.DataFrame='test.csv',weights=np.zeros(0))->np.array:
+    def predict(self,test_path_or_file:str|pd.DataFrame|pl.DataFrame='test.csv',weights=np.zeros(0),trained_models_ = [])->np.array:
+        # 事前学習したやつをself.trained_modelsに入れる
+        if trained_models_ != []:
+            self.trained_models = trained_models_
+
         if self.objective=='regression':
             self.PrintColor("predict......",color=Fore.GREEN)
             #weights:[1]*len(self.models)
