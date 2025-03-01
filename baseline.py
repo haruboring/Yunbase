@@ -1984,6 +1984,236 @@ class Yunbase():
         y=y.apply(lambda k:self.target2idx[k])
         return y
     
+    # fitで定義されるメンバ変数だけ定義する。学習はしない
+    def fit_(self,train_path_or_file:str|pd.DataFrame|pl.DataFrame='train.csv',
+            category_cols:list[str]=[],date_cols:list[str]=[],
+            target2idx:dict|None=None,
+           ):
+        if self.num_folds<2:#kfold must greater than 1
+            raise ValueError("num_folds must be greater than 1.")
+        #lightgbm:https://github.com/microsoft/LightGBM/blob/master/python-package/lightgbm/sklearn.py
+        #xgboost:https://github.com/dmlc/xgboost/blob/master/python-package/xgboost/sklearn.py
+        #category_cols:Convert string columns to 'category'.
+        self.category_cols=category_cols
+        self.date_cols=date_cols
+        self.PrintColor("fit......",color=Fore.GREEN)
+        self.PrintColor("load train data")
+        self.train=self.load_data(path_or_file=train_path_or_file,mode='train')
+        if self.kfold_col in self.train.columns:
+            if sorted(self.train[self.kfold_col].unique())!=list(np.arange(self.num_folds)):
+                raise ValueError(f"values in {self.kfold_col} must be one of [0,1,……,{self.num_folds-1}]")   
+        #process date_cols
+        for date_col in self.date_cols:
+            self.train[date_col]=pd.to_datetime(self.train[date_col])
+            self.train[date_col]=(self.train[date_col]-pd.to_datetime('1970-01-01')).dt.total_seconds()
+            self.train=self.construct_seasonal_feature(self.train,date_col,timestep='day')
+        self.train.drop(self.date_cols,axis=1,inplace=True)   
+        
+        self.sample_weight=self.train[self.weight_col]
+        self.train.drop([self.weight_col],axis=1,inplace=True)
+        self.target_dtype=self.train[self.target_col].dtype
+        try:#deal with TypeError: unhashable type: 'list'
+            self.train=self.train.drop_duplicates()
+        except:
+            pass
+        self.PrintColor("Feature Engineer")
+        self.train=self.base_FE(self.train,mode='train',drop_cols=self.drop_cols)
+        X=self.train.drop([self.group_col,self.target_col],axis=1,errors='ignore')
+        X.columns=self.colname_clean(list(X.columns))
+        print(f"train.shape:{X.shape}")
+        y=self.train[self.target_col]
+        
+        #special characters in columns'name will lead to errors when GBDT model training.
+        X_columns=list(X.columns)
+        print(f"feature_count:{len(X_columns)}")
+                
+        #classification:target2idx,idx2target
+        if self.objective!='regression':
+            y=self.set_target2idx(y,target2idx)
+
+        #save true label in train data to calculate final score 
+        self.features=X
+        self.target=y.values
+        
+        if self.exp_mode:#use log transform for target_col
+            self.exp_mode_b=-y.min()
+            y=np.log1p(y+self.exp_mode_b)
+        
+        if self.group_col!=None:
+            group=self.train[self.group_col]
+        else:
+            group=None
+        
+        #if you don't use your own models,then use built-in models.
+        self.PrintColor("load models")
+        if len(self.models)==0:
+            
+            metric=self.metric
+            if self.objective=='multi_class':
+                metric='multi_logloss'
+            #lightgbm don't support f1_score,but we will calculate f1_score as Metric.
+            if metric in ['f1_score','mcc','logloss','pr_auc','accuracy']:
+                metric='auc'
+            elif metric in ['medae','mape','smape']:
+                metric='mae'
+            elif metric in ['rmsle','msle','r2']:
+                metric='mse'
+            if self.custom_metric!=None:
+                if self.objective=='regression':
+                    metric='rmse'
+                elif self.objective=='binary':
+                    metric='auc'
+                elif self.objective=='multi_class':
+                    metric='multi_logloss'
+            lgb_params={"boosting_type": "gbdt","metric": metric,
+                        'random_state': self.seed,  "max_depth": 10,"learning_rate": 0.1,
+                        "n_estimators": 20000,"colsample_bytree": 0.6,"colsample_bynode": 0.6,"verbose": -1,"reg_alpha": 0.2,
+                        "reg_lambda": 5,"extra_trees":True,'num_leaves':64,"max_bin":255,
+                        'importance_type': 'gain',#better than 'split'
+                        }
+            #find new params then use optuna
+            if self.use_optuna_find_params:
+                if self.kfold_col not in X.columns:
+                    #choose cross validation
+                    if self.objective!='regression':
+                        if self.group_col!=None:#group
+                            kf=StratifiedGroupKFold(n_splits=self.num_folds,random_state=self.seed,shuffle=True)
+                        else:
+                            kf=StratifiedKFold(n_splits=self.num_folds,random_state=self.seed,shuffle=True)
+                    else:#regression
+                        if self.group_col!=None:#group
+                            kf=GroupKFold(n_splits=self.num_folds)
+                        else:
+                            kf=KFold(n_splits=self.num_folds,random_state=self.seed,shuffle=True)
+                    kf_folds=pd.DataFrame({self.kfold_col:np.zeros(len(y))})
+                    for fold, (train_index, valid_index) in (enumerate(kf.split(X,y,group))):
+                        kf_folds[self.kfold_col][valid_index]=fold
+                else:
+                    kf_folds=pd.DataFrame({self.kfold_col:X[self.kfold_col].values})
+                lgb_params=self.optuna_lgb(X=X.drop([self.kfold_col],axis=1,errors='ignore'),y=y,group=group,kf_folds=kf_folds,metric=metric)
+             
+            #catboost's metric
+            # Valid options are:  'CrossEntropy', 'CtrFactor', 'Focal', 'RMSE', 'LogCosh', 
+            # 'Lq','Quantile', 'MultiQuantile', 'Expectile', 'LogLinQuantile',
+            # 'Poisson', 'MSLE', 'MedianAbsoluteError', 'Huber', 'Tweedie', 'Cox', 
+            # 'RMSEWithUncertainty', 'MultiClass', 'MultiClassOneVsAll', 'PairLogit', 'PairLogitPairwise',
+            # 'YetiRank', 'YetiRankPairwise', 'QueryRMSE', 'GroupQuantile', 'QuerySoftMax', 
+            # 'QueryCrossEntropy', 'StochasticFilter', 'LambdaMart', 'StochasticRank', 
+            # 'PythonUserDefinedPerObject', 'PythonUserDefinedMultiTarget', 'UserPerObjMetric',
+            # 'UserQuerywiseMetric','NumErrors', 'FairLoss', 'BalancedAccuracy','Combination',
+            # 'BalancedErrorRate', 'BrierScore', 'Precision', 'Recall', 'TotalF1', 'F', 'MCC', 
+            # 'ZeroOneLoss', 'HammingLoss', 'HingeLoss', 'Kappa', 'WKappa', 'LogLikelihoodOfPrediction',
+            # 'NormalizedGini','PairAccuracy', 'AverageGain', 'QueryAverage', 'QueryAUC',
+            # 'PFound', 'PrecisionAt', 'RecallAt', 'MAP', 'NDCG', 'DCG', 'FilteredDCG', 'MRR', 'ERR', 
+            # 'SurvivalAft', 'MultiRMSE', 'MultiRMSEWithMissingValues', 'MultiLogloss', 'MultiCrossEntropy',
+
+            #catboost metric to params
+            metric2params={#regression
+                          'mse':'RMSE','rmsle':'RMSE','msle':'MSLE','rmse':'RMSE',
+                           'mae':'MAE','medae':'MAE','mape':'MAPE','r2':'R2','smape':'SMAPE',
+                          #classification
+                           'accuracy':'Accuracy','logloss':'Logloss','multi_logloss':'Accuracy',
+                           'f1_score':'F1','auc':'AUC','mcc':'MCC','pr_auc':'PRAUC',
+                          }
+            metric=metric2params.get(self.metric,'None')
+            
+            if self.custom_metric!=None:#use your custom_metric
+                if self.objective=='regression':
+                    metric='RMSE'
+                elif self.objective=='binary':
+                    metric='Logloss'
+                else:
+                    metric='Accuracy'
+                    
+            cat_params={
+                       'random_state':self.seed,
+                       'eval_metric'         : metric,
+                       'bagging_temperature' : 0.50,
+                       'iterations'          : 20000,
+                       'learning_rate'       : 0.1,
+                       'max_depth'           : 12,
+                       'l2_leaf_reg'         : 1.25,
+                       'min_data_in_leaf'    : 24,
+                       'random_strength'     : 0.25, 
+                       'verbose'             : 0,
+                      }
+            xgb_params={'random_state': self.seed, 'n_estimators': 20000, 
+                        'learning_rate': 0.1, 'max_depth': 10,
+                        'reg_alpha': 0.08, 'reg_lambda': 0.8, 
+                        'subsample': 0.95, 'colsample_bytree': 0.6, 
+                        'min_child_weight': 3,'early_stopping_rounds':self.early_stop,
+                        'enable_categorical':True,
+                       }
+
+            if self.device in ['cuda','gpu']:#gpu's name
+                lgb_params['device']='gpu'
+                lgb_params['gpu_use_dp']=True
+                cat_params['task_type']="GPU"
+                xgb_params['tree_method']='gpu_hist'
+            else:#self.device=='cpu'
+                lgb_params['n_jobs']=-1
+                xgb_params['n_jobs']=-1
+                
+            if self.objective=='regression':
+                self.models=[(LGBMRegressor(**lgb_params),'lgb'),
+                             (CatBoostRegressor(**cat_params),'cat'),
+                             (XGBRegressor(**xgb_params),'xgb')
+                            ]
+            else:
+                self.models=[(LGBMClassifier(**lgb_params),'lgb'),
+                             (CatBoostClassifier(**cat_params),'cat'),
+                             (XGBClassifier(**xgb_params),'xgb'),
+                            ]
+
+        for repeat in range(self.n_repeats):
+            if self.kfold_col not in X.columns:
+                #choose cross validation
+                if self.objective!='regression':
+                    if self.group_col!=None:#group
+                        kf=StratifiedGroupKFold(n_splits=self.num_folds,random_state=self.seed+repeat,shuffle=True)
+                    else:
+                        kf=StratifiedKFold(n_splits=self.num_folds,random_state=self.seed+repeat,shuffle=True)
+                else:#regression
+                    if self.group_col!=None:#group
+                        kf=GroupKFold(n_splits=self.num_folds)
+                    else:
+                        kf=KFold(n_splits=self.num_folds,random_state=self.seed+repeat,shuffle=True)
+                kf_folds=pd.DataFrame({self.kfold_col:np.zeros(len(y))})
+                #use groupkfoldshuffle
+                if (self.group_col!=None) and self.objective=='regression':
+                    unique_group=sorted(group.unique())
+                    random_group=unique_group.copy()
+                    np.random.shuffle(random_group)
+                    random_map={k:v for k,v in zip(unique_group,random_group)}
+                    group=group.apply(lambda x:random_map[x])
+                    group=group.sort_values()
+                    X=X.loc[list(group.index)]
+                    y=y.loc[list(group.index)]
+                    del unique_group,random_group,random_map
+                    gc.collect()
+                    
+                for fold, (train_index, valid_index) in (enumerate(kf.split(X,y,group))):
+                    kf_folds[self.kfold_col][valid_index]=fold
+                #sort_index
+                if (self.group_col!=None):
+                    X,y=X.sort_index(),y.sort_index()
+                    group,kf_folds=group.sort_index(),kf_folds.sort_index()
+            else:#custom_kfold
+                kf_folds=pd.DataFrame({self.kfold_col:X[self.kfold_col].values})
+            
+            #check params and update
+            for i in range(len(self.models)):
+                model,model_name=self.models[i]
+                if 'lgb' in model_name or 'xgb' in model_name or 'cat' in model_name:
+                    params=model.get_params()
+                    params['random_state']=self.seed+repeat
+                    model.set_params(**params)
+                self.models[i]=(model,model_name)
+                print(f"{self.models[i][1]}_params:{self.models[i][0].get_params()}")  
+                
+            self.PrintColor("model training SKIP!!!")
+
+
     def fit(self,train_path_or_file:str|pd.DataFrame|pl.DataFrame='train.csv',
             category_cols:list[str]=[],date_cols:list[str]=[],
             target2idx:dict|None=None,
