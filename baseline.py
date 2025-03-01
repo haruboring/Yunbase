@@ -939,32 +939,29 @@ class Yunbase():
     #reference: https://www.kaggle.com/code/cdeotte/first-place-single-model-cv-1-016-lb-1-016   In[6]
     def CV_stat(self,X,y=None,repeat:int=0,fold:int=0):
         if len(self.target_stat):
-            if type(y)==type(None):#valid set or test set(transform)
-                TE=self.trained_TE[f'TE_repeat{repeat}_fold{fold}.model']
-            else:#train set(fit and transform)
-                y=pd.DataFrame({self.target_col:y.values})
-                df=pd.concat((X,y),axis=1)
-                #repeat i fold j's TE  cat_col2value 
-                TE={}
-                for (g_col,t_col,agg) in self.target_stat:
-                    g_col=self.colname_clean([g_col])[0]
-                    if t_col!=self.target_col:
-                        t_col=self.colname_clean([t_col])[0]
-                        
-                    #deal with value_counts()<10 
-                    df_copy=df[[g_col,t_col]].copy()
-                    gcol2counts=df_copy[g_col].value_counts().to_dict()
-                    GCOLS=[gcol for gcol,count in gcol2counts.items() if count>min(10,len(df)//100) ]
-                    df_copy=df_copy[df_copy[g_col].isin(GCOLS)]
+            y=pd.DataFrame({self.target_col:y.values})
+            df=pd.concat((X,y),axis=1)
+            #repeat i fold j's TE  cat_col2value 
+            TE={}
+            for (g_col,t_col,agg) in self.target_stat:
+                g_col=self.colname_clean([g_col])[0]
+                if t_col!=self.target_col:
+                    t_col=self.colname_clean([t_col])[0]
                     
-                    agg_df = df_copy.groupby(g_col).agg(agg).reset_index()
-                    agg_df.columns = ['_'.join(x) for x in agg_df.columns]
-                    agg_df.columns = [ f'{g_col}_transform_{x}' for x in agg_df.columns if x!=g_col]
-                    agg_df=agg_df.rename(columns={f"{g_col}_transform_{g_col}_":g_col})
-                    TE[f"{g_col}_TE_{t_col}"]=agg_df
-                #save TE
-                self.pickle_dump(TE,self.model_save_path+f'TE_repeat{repeat}_fold{fold}_{self.target_col}.model')
-                self.trained_TE[f'TE_repeat{repeat}_fold{fold}.model']=copy.deepcopy(TE)
+                #deal with value_counts()<10 
+                df_copy=df[[g_col,t_col]].copy()
+                gcol2counts=df_copy[g_col].value_counts().to_dict()
+                GCOLS=[gcol for gcol,count in gcol2counts.items() if count>min(10,len(df)//100) ]
+                df_copy=df_copy[df_copy[g_col].isin(GCOLS)]
+                
+                agg_df = df_copy.groupby(g_col).agg(agg).reset_index()
+                agg_df.columns = ['_'.join(x) for x in agg_df.columns]
+                agg_df.columns = [ f'{g_col}_transform_{x}' for x in agg_df.columns if x!=g_col]
+                agg_df=agg_df.rename(columns={f"{g_col}_transform_{g_col}_":g_col})
+                TE[f"{g_col}_TE_{t_col}"]=agg_df
+            #save TE
+            self.pickle_dump(TE,self.model_save_path+f'TE_repeat{repeat}_fold{fold}_{self.target_col}.model')
+            self.trained_TE[f'TE_repeat{repeat}_fold{fold}.model']=copy.deepcopy(TE)
             #transform
             for k,agg_df in TE.items():
                 g_col,t_col=k.split("_TE_")
